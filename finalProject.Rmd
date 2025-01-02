@@ -1,0 +1,543 @@
+---
+title: "Final Project"
+author: "Adam Brown"
+date: "`r Sys.Date()`"
+output: 
+      rmdformats::readthedown:
+      self_contained: true
+      thumbnails: true
+      lightbox: true
+      gallery: false
+      highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(skimr)
+library(stringr)
+library(lubridate)
+library(ggthemes)
+library(arrow)
+library(data.table)
+library(broom)
+library(janitor)
+library(tidymodels)
+```
+
+
+Getting gun violence and county census data.
+
+```{r}
+gunViolence <- fread("gunViolenceGeo.csv")
+countyCensus <- fread("https://raw.githubusercontent.com/dilernia/STA418-518/main/Data/census_data_county_2009-2021.csv")
+```
+
+
+# Data Dictionary
+
+## Dictionary for `gunViolence` Data
+
+```{r}
+# Creating gunViolence data dictionary
+gunViolenceDictionary <- tibble(Variable = colnames(gunViolence),
+                         Description = c("FIPS code for county",
+                                         "Incident ID number",
+                                         "Date recorded (Jan 1, 2013 - Mar 31, 2018)",
+                                         "State",
+                                         "City or county",
+                                         "Street address incident took place",
+                                         "Number of people killed",
+                                         "Number of people injured",
+                                         "URL to the incident on the gunviolencearchive.org site",
+                                         "URL to the source article for the incident",
+                                         "Whether or not the incidenturl field is missing",
+                                         "Congressional district number (Ranges from 0 - 54)",
+                                         "Whether guns used in the incident were stolen (Gun number::Whether it was stolen or not, if known)",
+                                         "Type of gun used (Gun number::What type of gun, if known)",
+                                         "Characteristics about the incident (Whether shots were fired, type of area it took place, if someone was killed or injured, etc.)",
+                                         "Latitude incident took place",
+                                         "Discription of the location the incident took place such as a building name",
+                                         "Longitude incident took place",
+                                         "Number of guns involved",
+                                         "Additional notes from reports or if there is a discrepency in information, it is noted here",
+                                         "Age of participant (Participant number::Age)",
+                                         "Age group of participant (Adult (18+), Teen (12-17), or Child (0-11)) (Participant number::Age group)",
+                                         "Gender of participant (Participant number::Gender)",
+                                         "Name of participant (Participant number::Name)",
+                                         "How participants are related (EX: Family, Gang, Aquaintance, Mass Shooting, etc.) (Group number::Relation)",
+                                         "Status of participant (EX: Injured, Killed, Unharmed, Arrested) (Participant number::Status)",
+                                         "Type of participant (EX: Victim, Subject-Suspect) (Participant number::Type)",
+                                         "Sources used for the webpage",
+                                         "State house district (0 - 950)",
+                                         "State senate district (0 - 95)",
+                                         "Full address of incident"),
+                         Type = map_chr(gunViolence, .f = function(x){typeof(x)[1]}),
+                         Class = map_chr(gunViolence, .f = function(x){class(x)[1]}))
+
+knitr::kable(gunViolenceDictionary)
+```
+
+### Missingness in `gunViolence`
+
+```{r}
+# Creating a table for number of missing values in each column of the gunViolence data set
+knitr::kable(colSums(is.na(gunViolence)) / nrow(gunViolence) * 100, col.names = c("Variable Name", "Percent Missing"))
+```
+
+As shown in the table above, much of the Gun Violence data set is missing, most notably `participant_relationship`, `location_description`, and `participant_name` all have more missing values than actual data. To avoid issues with the data set, I will focus on using rows with much less missingness such as `date`, `state`, `city_or_county`, `n_killed`, and `n_injured` which are all fully present in the data set as well as `address_full` which has only 3.31% missingness.
+
+## Dictionary for `countyCensus` Data
+
+```{r}
+# Creating countyCensus data dictionary
+countyDictionary <- tibble(Variable = colnames(countyCensus),
+                         Description = c("FIPS code for county",
+                                         "County, State",
+                                         "Year recorded (2009 - 2021)",
+                                         "Population of county",
+                                         "Median income for county (USD)",
+                                         "Median rent cost per month (USD)",
+                                         "Median home cost per month (USD)",
+                                         "Proportion of females in county",
+                                         "Proportion of males in county",
+                                         "Proportion of county in poverty"),
+                         Type = map_chr(countyCensus, .f = function(x){typeof(x)[1]}),
+                         Class = map_chr(countyCensus, .f = function(x){class(x)[1]}))
+
+knitr::kable(countyDictionary)
+```
+
+### Missingness in `countyCensus`
+
+```{r}
+skimr::skim(countyCensus)
+```
+
+The County Census data has a very low missingness. No variable has less than a 99.9% complete rate. This means that the missing values should not impact the data set in meaningful ways.
+
+# Data Cleaning
+
+## Merging Data Sets
+
+Merging both the `gunViolence` and `countyCensus` data sets into a `gunViolenceWithCensus` data set.
+
+```{r}
+# Getting a year variable for gunViolence
+gunViolence <- gunViolence %>%
+  dplyr::mutate(year = year(date))
+
+# Merging the gunViolence and countyCensus data
+gunViolenceWithCensus <- gunViolence %>%
+  left_join(countyCensus, by = c("geoid", "year"))
+```
+
+## String Manipulation
+
+Creating a `street` variable in `gunViolenceWithCensus` with the street, city, and state of each incident.
+
+```{r}
+# Creating a street variable without the address numbers or zip code
+gunViolenceWithCensus <- gunViolenceWithCensus %>%
+  dplyr::mutate(street = str_remove_all(address_full, pattern = regex("[:digit:]+,"))) %>%
+  dplyr::mutate(street = str_remove_all(street, pattern = regex("1$")))
+```
+
+Creating an `arrested` variable for the number of people arrested in each gun violence incident.
+
+```{r}
+# Counting the number of people arrested in each gun violence incident
+gunViolenceWithCensus <- gunViolenceWithCensus %>%
+  dplyr::mutate(num_arrested = str_count(str_to_lower(participant_status), pattern = "arrested"))
+```
+
+Creating variables for the `day` and `month` of each incident.
+
+```{r}
+# Creating seperate year, month, and day columns for gunViolenceWithCensus
+gunViolenceWithCensus <- gunViolenceWithCensus %>%
+  dplyr::mutate(month = substr(date, 6, 7)) %>%
+  dplyr::mutate(day = substr(date, 9, 10))
+```
+
+# Exploratory Data Analysis
+
+## Tables of Summary Statistics
+
+Getting the 10 streets with the highest number of reported gun violence incidents in the United States.
+
+```{r}
+# Table with the streets with the most gun violence incidents 
+gunViolenceWithCensus %>%
+  dplyr::filter(!is.na(street)) %>%
+  dplyr::group_by(street) %>%
+  dplyr::count() %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(desc(n)) %>%
+  dplyr::slice_head(n = 10) %>%
+  knitr::kable(col.names = c("Street", "Number of Incidents"), caption = "Table 1: Streets with the most reported gun violence incidents January 2013 - March 2018")
+```
+
+Getting a table for the average number of gun violence incidents in Illinois counties per year between 2014 and 2017.
+
+```{r}
+# Creating table for average # of incidents per year for each Illinois county
+gunViolenceWithCensus %>%
+  dplyr::filter(!is.na(county_state)) %>%
+  dplyr::group_by(county_state, year) %>%
+  dplyr::filter(state == "Illinois" ) %>%
+  dplyr::filter(year != 2013 & year != 2018) %>%
+  dplyr::count() %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(county_state) %>%
+  dplyr::summarize(incidents = mean(n)) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(desc(incidents)) %>%
+  dplyr::slice_head(n = 10) %>%
+  knitr::kable(col.names = c("County", "Number of Incidents"), caption = "Table 2: Average number of gun violence incidents in Illinois counties per year from 2014 - 2017")
+```
+
+## Data Visualizations
+
+Dot plot for gun violence incidents per day.
+
+```{r}
+# Finding the number of gun violence incidents per day
+gunViolenceWithCensus %>%
+  dplyr::filter(year != 2013) %>%
+  dplyr::group_by(date) %>%
+  dplyr::count() %>%
+  dplyr::ungroup() %>%
+
+# Creating a dot plot
+  ggplot(aes(x = date, y = n)) +
+  stat_summary(geom = "point", 
+               fun = mean,
+               size = 1.5,
+               color = "darkred") +
+  geom_smooth(aes(x = date,
+             y = n), 
+             method = "lm", 
+             se = FALSE, 
+             size = 1, 
+             color = "darkblue") + 
+  labs(title = "Average number of recorded gun violence incidents per day",
+      subtitle = "from 2014 - 2018",
+      x = "Year",
+      y = "Number of incidents recorded",
+      caption = "Source: Gun Violence Archive") +
+  ggthemes::theme_few()
+```
+
+Creating a histogram for number of gun violence incidents per year without injuries or deaths.
+
+```{r}
+# Getting incidents per year without injuries or deaths
+gunViolenceWithCensus %>%
+  dplyr::group_by(year) %>%
+  dplyr::filter(year != 2013 & year != 2018) %>%
+  dplyr::select(year, n_killed, n_injured) %>%
+  dplyr::mutate(k = n_killed == 0 & n_injured == 0) %>%
+  dplyr::count(k) %>%
+  ungroup() %>%
+
+# Creating plot
+  ggplot(aes(x = year, y = n, fill = k)) +
+  geom_col() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_colorblind() +
+  labs(title = "Number of recorded gun violence incidents without injuries or deaths",
+      subtitle = "from 2014 - 2017",
+      x = "Year",
+      y = "Number of incidents recorded",
+      caption = "Source: Gun Violence Archive",
+      fill = "No injuries or deaths") +
+  ggthemes::theme_few()
+```
+
+Creating a histogram for the average poverty rate per year.
+
+```{r}
+# Getting mean poverty proportion per year
+gunViolenceWithCensus %>%
+  group_by(year) %>%
+  summarize(mean = mean(prop_poverty, na.rm = TRUE)) %>%
+  ungroup() %>%
+  
+# Creating histogram
+  ggplot(aes(x = year, y = mean)) +
+  geom_col(fill = "dodgerblue") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Proportion of people in poverty per year",
+      subtitle = "from 2013 - 2018",
+      x = "Year",
+      y = "Proportion of people in poverty",
+      caption = "Source: US Census Data") +
+  ggthemes::theme_few()
+```
+
+Creating a line graph for the average number of gun violence deaths per day in Chicago, Illinois.
+
+```{r}
+# Getting data from Chicago
+gunViolenceWithCensus %>%
+  dplyr::filter(geoid == 17031 & year != 2013) %>%
+  
+# Creating plot
+  ggplot(aes(x = date, y = n_killed)) +
+  geom_smooth(aes(x = date,
+             y = n_killed), 
+             method = "lm", 
+             se = FALSE, 
+             size = 1, 
+             color = "darkred") +
+  labs(title = "Average Number of people in Chicago killed in gun violence per day",
+      subtitle = "from 2014 - 2018",
+      x = "Year",
+      y = "Number of people killed",
+      caption = "Source: Gun Violence Archive") +
+  ggthemes::theme_few()
+```
+
+Creating a histogram for the proportion of gun violence cases that happen in Chicago per year.
+
+```{r}
+# Getting incidents per year without injuries or deaths
+gunViolenceWithCensus %>%
+  dplyr::group_by(year) %>%
+  dplyr::filter(year != 2013 & year != 2018 & !is.na(geoid)) %>%
+  dplyr::select(year, geoid) %>%
+  dplyr::mutate(chicago = geoid == 17031) %>%
+  dplyr::count(chicago) %>%
+  ungroup() %>%
+
+# Creating plot
+  ggplot(aes(x = year, y = n, fill = chicago)) +
+  geom_col() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_colorblind() +
+  labs(title = "Number of recorded gun violence incidents in Chicago vs the US",
+      subtitle = "from 2014 - 2017",
+      x = "Year",
+      y = "Number of incidents recorded",
+      caption = "Source: Gun Violence Archive",
+      fill = "Incident in Chicago") +
+  ggthemes::theme_few()
+```
+
+# Monte Carlo Methods of Inference
+
+Getting a table of top 5 county populations for 2018.
+
+```{r}
+countyCensus %>%
+  dplyr::filter(year == 2018) %>%
+  dplyr::arrange(desc(population)) %>%
+  dplyr::select(geoid, county_state, population) %>%
+  dplyr::slice_head(n = 5) %>%
+  knitr::kable(col.names = c("Geoid (FIPS Code)", "County", "Population"))
+```
+
+Here I will explore the number of gun violence incidents in Cook County, Illinois (Chicago) vs Harris County, Texas (Huston) as they have similar population sizes.
+
+```{r}
+# Getting just the data for incidents in Chicago and Huston
+chicagoVsHustonData <- gunViolenceWithCensus %>%
+  dplyr::filter(geoid == 17031 | geoid == 48201) %>%
+  dplyr::filter(year != 2013 & year != 2018)
+```
+
+Given their similar population sizes, it would make sense for them to have a similar number of gun violence incidents each year. Our null hypothesis is that there is no difference in their amount of gun violence incidents.
+
+To start, we'll implement Welch’s two-sample t-test to test if both cities have similar numbers of gun violence incidents.
+
+```{r}
+# Getting the number of incidents per year
+chicagoVsHustonCount <- chicagoVsHustonData %>%
+  dplyr::group_by(county_state, year) %>%
+  dplyr::count() %>%
+  dplyr::mutate(num_incidents = n) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(county_state, year, num_incidents)
+
+#Implementing a two-sample t-test
+tResult <- t_test(x = chicagoVsHustonCount,
+                  response = num_incidents,
+                  explanatory = county_state, 
+                  order = c("Cook County, Illinois", "Harris County, Texas"),
+                  alternative = "greater")
+
+# Printing the T-Test Results
+tResult %>% 
+  knitr::kable()
+```
+
+This T-test is statistically significant and shows that there is a difference between the two cities amount of gun violence incidents.
+
+To show this, we will create a box plot for the two counties.
+
+```{r}
+chicagoVsHustonCount %>% 
+# Creating a box plot
+  ggplot(aes(x = county_state, y = num_incidents,
+                         fill = county_state)) +
+  stat_boxplot(geom = "errorbar", width = 0.2, coef = 1.5) +
+  stat_boxplot(geom = "boxplot", width = 0.5, coef = 1.5,
+               outlier.shape = 8) +
+  stat_summary(fun = "mean", geom = "point", shape = 23, fill = "black",
+               color = "white") +
+  scale_fill_manual(values = c("lightblue", "darkgreen")) +
+    coord_flip() +
+    labs(title = "Average number of gun violence incidents per year",
+         subtitle = "from 2014 - 2017",
+         x = "County",
+         y = "Number of incidents",
+         caption = "Source: Gun Violence Archive") +
+  ggthemes::theme_few() +
+  theme(legend.position = "none") 
+```
+```{r}
+# Calculating standard deviations and variances for each group
+chicagoVsHustonCount %>% 
+  group_by(county_state) %>% 
+  summarize(Mean = mean(num_incidents),
+            n = n(),
+            SD = sd(num_incidents),
+            Variance = var(num_incidents)) %>% 
+  knitr::kable()
+```
+
+
+We can also implement a randomization test for the data.
+
+```{r}
+# Number of permutations to do
+nperms <- 500
+
+# Instantiating vector for test statistics
+permTs <- vector(length = nperms)
+
+# Calculating t-test statistic for each permutation
+for(p in 1:nperms) {
+  permTs[p] <- chicagoVsHustonCount %>% 
+  dplyr::mutate(county_state = sample(county_state, replace = FALSE)) %>%
+  t_test(response = num_incidents,
+        explanatory = county_state, 
+        order = c("Cook County, Illinois", "Harris County, Texas"),
+        alternative = "greater") %>%
+  pull(statistic)
+}
+```
+
+We can display the distribution we got from this in a histogram.
+
+```{r}
+# Turning the vector we have into a tibble in order to use it in ggplot
+tidy_ts <- tibble(Statistic = permTs)
+
+
+# Creating a histogram
+tidy_ts %>%
+  ggplot(aes(x = Statistic)) +
+  geom_histogram(color = "white") +
+  labs(title = "Randomization Test Null Distribution",
+       y = "Frequency",
+       x = "t-test statistic") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  geom_vline(xintercept = quantile(permTs, probs = 0.95), color = "red", lty = "dashed") +
+  geom_vline(xintercept = tResult$statistic, color = "dodgerblue") +
+  ggthemes::theme_few()
+```
+
+Finally, we can calculate the p-value of our randomization test.
+
+```{r}
+# Proportion of randomization test statistics greater than or equal to our observed t-test statistic
+mean(permTs >= tResult$statistic)
+
+janitor::tabyl(permTs >= tResult$statistic)
+```
+
+This gets us a p-value of 0.01 which means that we reject the null hypothesis.
+
+This means that we have sufficient evidence that Chicago has a greater amount of gun violence incidents per year compared to Huston at the 5% significance level.
+
+# Bootstrap Methods of Inference
+
+To start our bootstrap, we'll create a subset of our yearly incident data that only has the data from Chicago.
+
+```{r}
+# Subsetting to Chicago
+ChicagoData <- chicagoVsHustonCount %>%
+  dplyr::filter(county_state == "Cook County, Illinois")
+```
+
+We will have a sample size of 4 because that is the amount of years we had data on Chicago for in the original data set.
+
+```{r}
+# Calculating the sample median number of incidents
+median(ChicagoData$num_incidents)
+```
+
+Half the years recorded more than 2,823 gun violence incidents in Chicago.
+
+Now, we'll create our bootstrap method.
+
+```{r}
+# Number of bootstrap samples
+B <- 10000
+
+# Instantiating matrix for bootstrap samples
+boots <- matrix(NA, nrow = 4, ncol = B)
+
+# Sampling with replacement B times
+for(b in 1:B) {
+boots[, b] <- ChicagoData %>% 
+  slice_sample(prop = 1, replace = TRUE) %>% 
+  dplyr::pull(num_incidents)
+}
+```
+
+We can then get the medians for each of these bootstraps.
+
+```{r}
+# Instantiating vector for bootstrap medians
+boot_medians <- vector(length = B)
+
+# Calculating medians for bootstrap samples
+for(b in 1:B) {
+boot_medians[b] <- median(boots[, b])
+}
+```
+
+Next, we can create a histogram to show our distribution of sample medians for our bootstrap.
+
+```{r}
+# Visualizing the non-parametric bootstrap distribution
+tibble(Median = boot_medians) %>%
+  ggplot(aes(x = Median)) +
+  geom_histogram(color = "white") +
+  labs(title = "Nonparametric bootstrap distribution of sample medians",
+       x = "Median",
+       y = "Frequency") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  geom_vline(xintercept = quantile(boot_medians, probs = c(0.025)), color = "dodgerblue", lty = "dotted") +
+  geom_vline(xintercept = quantile(boot_medians, probs = c(0.975)), color = "dodgerblue", lty = "dotted")
+```
+```{r}
+# Calculating the standard error
+sd(boot_medians)
+```
+
+```{r}
+# Calculating quantiles of the bootstrap distribution
+quantile(boot_medians, probs = c(0.025, 0.975))
+```
+
+We are 95% confident that each given year, for at least half of them, Chicago will have between 2,128 and 3,529 gun violence incidents.
+
+# Conclusions / Main Takeaways
+
+Overall, we can be confident that Chicago will have more gun violence incidents than Huston in a given year regardless of their similar population sizes, with a median amount of between 2,128 and 3,529 incidents.
+
+
